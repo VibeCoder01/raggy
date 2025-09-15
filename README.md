@@ -19,6 +19,11 @@ A lightweight, local-first RAG server that uses embeddings from a local Ollama i
   - Install: https://ollama.com
   - Pull the embeddings model: `ollama pull nomic-embed-text`
 
+## Security
+
+- The server has no authentication and trusts callers with direct access to the host filesystem. Run it only on a trusted machine or behind a firewall/VPN.
+- Requests can reference absolute paths; never expose the HTTP API to untrusted networks.
+
 ## Quick Start
 
 1) Configure environment

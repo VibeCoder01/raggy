@@ -13,8 +13,16 @@ export async function ensureDir(dir) {
 }
 export async function listFilesRec(dir) {
     const out = [];
+    const skipped = [];
     async function walk(d) {
-        const list = await fs.readdir(d, { withFileTypes: true });
+        let list;
+        try {
+            list = await fs.readdir(d, { withFileTypes: true });
+        }
+        catch (err) {
+            skipped.push({ path: d, error: err?.code || String(err) });
+            return;
+        }
         for (const e of list) {
             const p = path.join(d, e.name);
             if (e.isDirectory())
@@ -24,7 +32,7 @@ export async function listFilesRec(dir) {
         }
     }
     await walk(dir);
-    return out;
+    return { files: out, skipped };
 }
 export async function readTextFile(p) {
     const buf = await fs.readFile(p);
@@ -140,7 +148,7 @@ export async function expandGlobsDetailed(paths, opts = {}) {
         }
         const reFull = globPathToRegExp(s);
         try {
-            const files = await listFilesRec(baseDir);
+            const { files } = await listFilesRec(baseDir);
             const matches = files.filter(fp => reFull.test(fp));
             if (matches.length)
                 out.push(...matches);

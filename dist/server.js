@@ -302,6 +302,10 @@ export function createServer() {
                 disc.push(`skipped ${(result.skippedDuplicateChunks ?? 0)} duplicate chunk(s)`);
             if ((result.skippedEmptyEmbeddingChunks ?? 0) > 0)
                 disc.push(`skipped ${(result.skippedEmptyEmbeddingChunks ?? 0)} chunk(s) with empty embeddings`);
+            if ((result.skippedFilesNoEmbeddings ?? 0) > 0)
+                disc.push(`skipped ${(result.skippedFilesNoEmbeddings ?? 0)} file(s) with no usable embeddings`);
+            if ((result.skippedPaths?.length ?? 0) > 0)
+                disc.push(`skipped ${(result.skippedPaths?.length ?? 0)} path(s) due to access errors`);
             const discMsg = disc.length ? ` discrepancy: ${disc.join('; ')}; action: ignored missing/empty entries` : ' discrepancy: none';
             console.log(`[ingest] result: added=${result.added} chunks=${result.chunks} in ${ms}ms;${discMsg}`);
             res.json({ ...result, invalidPaths: disc.length ? invalidPaths : undefined });

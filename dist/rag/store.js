@@ -129,52 +129,21 @@ export async function atomicWriteFile(filePath, data) {
     await fs.rename(tmpPath, filePath);
 }
 async function atomicAppendLines(filePath, lines) {
-    const tmpPath = filePath + '.tmp';
-    // Stream existing file (if any) into tmp, then append new lines
-    const ws = fsc.createWriteStream(tmpPath, { encoding: 'utf8' });
-    await new Promise((resolve, reject) => {
-        const rs = fsc.createReadStream(filePath, { encoding: 'utf8' });
-        rs.on('error', (err) => {
-            if (err && err.code === 'ENOENT') {
-                resolve();
-            }
-            else {
-                reject(err);
-            }
-        });
-        rs.pipe(ws, { end: false });
-        rs.on('end', resolve);
-    }).catch(async (e) => {
-        // If original doesn't exist, ensure ws is open before continuing
-        if (String(e?.code || '') !== 'ENOENT')
-            throw e;
-    });
-    await new Promise((resolve, reject) => {
-        try {
-            if (lines.length)
-                ws.write(lines.join('\n') + '\n');
-            ws.end(resolve);
-        }
-        catch (e) {
-            reject(e);
-        }
-    });
-    // fsync to flush
-    await new Promise((resolve, reject) => {
-        // @ts-ignore types for fd
-        fsc.open(tmpPath, 'r+', (err, fd) => {
-            if (err)
-                return reject(err);
-            fsc.fsync(fd, (err2) => {
-                fsc.close(fd, () => (err2 ? reject(err2) : resolve()));
-            });
-        });
-    });
-    await fs.rename(tmpPath, filePath);
+    if (!lines.length)
+        return;
+    const data = lines.join('\n') + '\n';
+    const handle = await fs.open(filePath, 'a');
+    try {
+        await handle.writeFile(data, 'utf8');
+        await handle.sync();
+    }
+    finally {
+        await handle.close();
+    }
 }
-export async function ingestPaths(paths) {
+export async function ingestPaths(paths, opts = {}) {
     await initStore();
-    const embedder = createEmbedder();
+    const embedder = opts.embedder ?? createEmbedder();
     const registry = await listRegistry();
     let addedDocs = 0, addedChunks = 0;
     const chunkLines = [];
@@ -184,7 +153,11 @@ export async function ingestPaths(paths) {
     let skippedNonTextFiles = 0;
     let skippedEmptyEmbeddingChunks = 0;
     let skippedDuplicateChunks = 0;
+    let skippedFilesNoEmbeddings = 0;
     const duplicateChunksByFile = {};
+    const enumerated = new Map();
+    const skippedPaths = [];
+    const seenSkipped = new Set();
     // Set running state immediately so UI doesn't see 'idle'
     currentProgress = {
         status: 'running',
@@ -200,9 +173,21 @@ export async function ingestPaths(paths) {
         const st = await statSafe(p);
         if (!st)
             continue;
-        const files = st.isDirectory() ? await listFilesRec(p) : [p];
-        for (const f of files)
+        let listing;
+        if (st.isDirectory())
+            listing = await listFilesRec(p);
+        else
+            listing = { files: [p], skipped: [] };
+        enumerated.set(p, listing);
+        for (const f of listing.files)
             allFiles.push(f);
+        for (const skip of listing.skipped || []) {
+            const key = `${skip.path}|${skip.error || ''}`;
+            if (!seenSkipped.has(key)) {
+                seenSkipped.add(key);
+                skippedPaths.push({ path: skip.path, reason: skip.error || 'unknown' });
+            }
+        }
     }
     try {
         currentProgress.totalFiles = allFiles.length;
@@ -215,7 +200,22 @@ export async function ingestPaths(paths) {
         if (!st)
             continue;
         validPaths++;
-        const files = st.isDirectory() ? await listFilesRec(p) : [p];
+        let listing = enumerated.get(p);
+        if (!listing) {
+            if (st.isDirectory())
+                listing = await listFilesRec(p);
+            else
+                listing = { files: [p], skipped: [] };
+            enumerated.set(p, listing);
+            for (const skip of listing.skipped || []) {
+                const key = `${skip.path}|${skip.error || ''}`;
+                if (!seenSkipped.has(key)) {
+                    seenSkipped.add(key);
+                    skippedPaths.push({ path: skip.path, reason: skip.error || 'unknown' });
+                }
+            }
+        }
+        const files = listing.files || [];
         for (const file of files) {
             processedFiles++;
             // Handle PDFs specially; skip other non-text files
@@ -318,27 +318,16 @@ export async function ingestPaths(paths) {
                 catch { }
                 continue;
             }
-            registry.push({ id: docId, path: file, addedAt: new Date().toISOString(), mtimeMs, size, contentHash });
-            addedDocs++;
             let embeddings = await embedder.embed(embedTexts);
             // Normalize embeddings at write time (unit L2)
             embeddings = embeddings.map((e) => Array.isArray(e) ? l2Normalize(e) : e);
-            // Update meta info with dim and normalization
-            try {
-                const meta = await readMeta();
-                if (!meta.dim && Array.isArray(embeddings[0]))
-                    meta.dim = embeddings[0].length | 0;
-                if (meta.normalised !== true)
-                    meta.normalised = true;
-                if (!meta.embeddingModel)
-                    meta.embeddingModel = env.EMBEDDINGS_MODEL;
-                await writeMeta(meta);
-            }
-            catch { }
             try {
                 currentProgress.currentFileStatus = 'writing';
             }
             catch { }
+            const fileChunkLines = [];
+            let fileChunksAdded = 0;
+            let firstValidEmbedding = null;
             for (let i = 0; i < chunks.length; i++) {
                 const emb = embeddings[i];
                 if (!Array.isArray(emb) || emb.length === 0 || !Number.isFinite(emb[0] ?? 0)) {
@@ -347,14 +336,42 @@ export async function ingestPaths(paths) {
                 }
                 const meta = richChunks[i] || {};
                 const rec = { id: `${docId}:${i}`, docId, path: file, chunkIndex: i, text: chunks[i], embedding: emb, heading: meta.heading, page: meta.page };
-                chunkLines.push(JSON.stringify(rec));
-                addedChunks++;
+                fileChunkLines.push(JSON.stringify(rec));
+                fileChunksAdded++;
+                if (!firstValidEmbedding)
+                    firstValidEmbedding = emb;
                 try {
                     currentProgress.currentFileProcessedChunks = i + 1;
                     currentProgress.updatedAt = new Date().toISOString();
                 }
                 catch { }
             }
+            if (fileChunksAdded === 0) {
+                if (chunks.length > 0)
+                    skippedFilesNoEmbeddings++;
+                try {
+                    currentProgress.currentFileStatus = 'skipped';
+                }
+                catch { }
+                continue;
+            }
+            try {
+                const meta = await readMeta();
+                if (firstValidEmbedding && Array.isArray(firstValidEmbedding) && firstValidEmbedding.length > 0) {
+                    if (!meta.dim)
+                        meta.dim = firstValidEmbedding.length | 0;
+                    meta.normalised = true;
+                }
+                if (!meta.embeddingModel)
+                    meta.embeddingModel = env.EMBEDDINGS_MODEL;
+                await writeMeta(meta);
+            }
+            catch { }
+            registry.push({ id: docId, path: file, addedAt: new Date().toISOString(), mtimeMs, size, contentHash });
+            addedDocs++;
+            addedChunks += fileChunksAdded;
+            for (const line of fileChunkLines)
+                chunkLines.push(line);
             try {
                 currentProgress.currentFileStatus = 'done';
             }
@@ -380,6 +397,8 @@ export async function ingestPaths(paths) {
         skippedNonTextFiles,
         skippedEmptyEmbeddingChunks,
         skippedDuplicateChunks,
+        skippedFilesNoEmbeddings,
+        skippedPaths: skippedPaths.length ? skippedPaths : undefined,
         duplicateChunksByFile: Object.keys(duplicateChunksByFile).length ? duplicateChunksByFile : undefined,
     };
     try {

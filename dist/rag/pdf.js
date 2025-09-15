@@ -1,5 +1,6 @@
 import { promises as fs } from 'fs';
 import zlib from 'zlib';
+const MAX_PDF_STREAM_SIZE = 10 * 1024 * 1024;
 function bufferIndexOf(buf, search, start = 0) {
     return buf.indexOf(typeof search === 'string' ? Buffer.from(search) : search, start);
 }
@@ -26,6 +27,26 @@ function hexToString(hex) {
     const clean = hex.replace(/[^0-9a-fA-F]/g, '');
     const bytes = Buffer.from(clean.length % 2 ? clean + '0' : clean, 'hex');
     return bytes.toString('utf8');
+}
+function inflateWithLimit(data, limit) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        let total = 0;
+        const stream = zlib.createInflate();
+        stream.on('data', (chunk) => {
+            total += chunk.length;
+            if (total > limit) {
+                const err = new Error('PDF stream exceeds limit');
+                err.code = 'PDF_STREAM_TOO_LARGE';
+                stream.destroy(err);
+                return;
+            }
+            chunks.push(chunk);
+        });
+        stream.on('error', reject);
+        stream.on('end', () => resolve(Buffer.concat(chunks)));
+        stream.end(data);
+    });
 }
 export async function extractPdfText(filePath) {
     const buf = await fs.readFile(filePath);
@@ -56,9 +77,15 @@ export async function extractPdfText(filePath) {
         let content = data;
         try {
             if (hasFlate)
-                content = zlib.inflateSync(data);
+                content = await inflateWithLimit(data, MAX_PDF_STREAM_SIZE);
         }
-        catch { /* ignore inflate errors */ }
+        catch {
+            content = Buffer.alloc(0);
+        }
+        if (!content || content.length === 0) {
+            pos = eIdx + 'endstream'.length;
+            continue;
+        }
         const text = content.toString('latin1');
         // Extract text between BT ... ET blocks
         const btRe = /BT([\s\S]*?)ET/gm;

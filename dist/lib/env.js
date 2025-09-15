@@ -1,5 +1,10 @@
-import dotenv from 'dotenv';
-dotenv.config();
+try {
+    const dotenv = await import('dotenv');
+    const cfg = typeof dotenv?.config === 'function' ? dotenv.config : (typeof dotenv?.default?.config === 'function' ? dotenv.default.config : null);
+    if (cfg)
+        cfg.call(dotenv);
+}
+catch { }
 export const env = {
     NODE_ENV: process.env.NODE_ENV ?? 'development',
     PORT: Number(process.env.PORT ?? 3000),
